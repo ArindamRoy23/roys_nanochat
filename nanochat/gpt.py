@@ -2,6 +2,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import torch.nn as nn
 import torch
+from nanochat.flash_attention import flash_attn
 
 
 @dataclass
@@ -19,19 +20,21 @@ class GPTConfig:
 def norm(x):
     return F.rms_norm(x, (x.size(-1), ))
 
+
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
-def apply_rotary_emb(x, cos, sin):
 
+def apply_rotary_emb(x, cos, sin):
 
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
+    x1, x2 = x[..., :d], x[..., d:]  # split up last dim into two halves
+    y1 = x1 * cos + x2 * sin  # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
 
 # -----------------------------------------------------------------------------
 
@@ -54,7 +57,7 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.layer_idx = layer_idx 
+        self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
@@ -76,32 +79,61 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate = nn.Linear(
             self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(
                 layer_idx, config.n_layer) else None
-    
+
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         """
-        Default config dimension:
-        BSZ: 1
-        T: 2048
-        C: 768
-        x: Input tensor of shape (BSZ, 2048, 768) 
-        ve: Value Embedding tensor of shape (BSZ, 1, 6, 128)
-        cos_sin: Rotary Embeddings tensor of shape (1, 2048, 768)
-        window_size: Window size of 2048
-        kv_cache: Key-Value cache tensor of shape (BSZ, 2048, 6, 128)
+
+            Default config dimension:
+            BSZ: 1
+            T: 2048
+            C: 768
+            ---
+            x: Input tensor of shape (BSZ, 2048, 768) 
+            ve: Value Embedding tensor of shape (BSZ, 1, 6, 128)
+            cos_sin: Rotary Embeddings tensor of shape (1, 2048, 768)
+            window_size: Window size of 2048
+            kv_cache: Key-Value cache tensor of shape (BSZ, 2048, 6, 128)
         """
-        B, T, C = x.size() # (BSZ, 2048, 768)
+        B, T, C = x.size()  # (BSZ, 2048, 768)
 
         # (BSZ, 2048, 768)*(768, 768)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim) # (BSZ, 2048, 6, 128)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim) # (BSZ, 2048, 6, 128)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim) # (BSZ, 2048, 6, 128)
+        q = self.c_q(x).view(B, T, self.n_head,
+                             self.head_dim)  # (BSZ, 2048, 6, 128)
+        k = self.c_k(x).view(B, T, self.n_kv_head,
+                             self.head_dim)  # (BSZ, 2048, 6, 128)
+        v = self.c_v(x).view(B, T, self.n_kv_head,
+                             self.head_dim)  # (BSZ, 2048, 6, 128)
 
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim) # (BSZ, 1, 6, 128)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            # ve should be (B, 1, n_kv_head, head_dim) and broadcast to (B, T, n_kv_head, head_dim)
+            gate = 2 * torch.sigmoid(
+                self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
-        
+
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+        q, k = norm(q), norm(k)  # QK norm
+
+        if kv_cache is None:
+            y = flash_attn.flash_attn_func(q,
+                                           k,
+                                           v,
+                                           causal=True,
+                                           window_size=window_size)
+        else:
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache,
+                k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True,
+                window_size=window_size)
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
