@@ -7,6 +7,9 @@ from nanochat.flash_attention import flash_attn
 
 @dataclass
 class GPTConfig:
+    '''
+    GPTConfig is a dataclass that contains the configuration for the GPT model.
+    '''
     sequence_len: int = 2048
     vocab_size: int = 32768
     n_layer: int = 12
@@ -18,6 +21,9 @@ class GPTConfig:
 
 # -----------------------------------------------------------------------------
 def norm(x):
+    """
+    norm is a function that normalizes the input tensor.
+    """
     return F.rms_norm(x, (x.size(-1), ))
 
 
@@ -137,3 +143,25 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+    
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        """
+        Forward pass through the block.
+
+        x: Input tensor of shape (BSZ, T, C)
+        ve: Value Embedding tensor of shape (BSZ, 1, n_kv_head, head_dim)
+        cos_sin: Rotary Embeddings tensor of shape (1, T, C)
+        window_size: Window size of 2048
+        kv_cache: Key-Value cache tensor of shape (BSZ, T, n_kv_head, head_dim)
+
+        Returns:
+            Output tensor of shape (BSZ, T, C)
+        """
+        x = self.attn(x, ve, cos_sin, window_size, kv_cache)
+        x = self.mlp(x)
+        return x
