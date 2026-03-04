@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch.nn as nn
 import torch
 from nanochat.flash_attention import flash_attn
+from nanochat.common import get_dist_info
 
 
 @dataclass
@@ -13,7 +14,7 @@ class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
     n_layer: int = 12
-    n_head: int = 6  # number of query heads
+    n_head: int = 6  # number of query heads #TODO: Rename to n_q_head
     n_kv_head: int = 6  # number of key/value heads (GQA)
     n_embd: int = 768
     window_pattern: str = "SSSL"
@@ -99,6 +100,7 @@ class CausalSelfAttention(nn.Module):
             cos_sin: Rotary Embeddings tensor of shape (1, 2048, 768)
             window_size: Window size of 2048
             kv_cache: Key-Value cache tensor of shape (BSZ, 2048, 6, 128)
+            c_proj: Projection weights tensor of shape (768, 768)
         """
         B, T, C = x.size()  # (BSZ, 2048, 768)
 
@@ -130,8 +132,11 @@ class CausalSelfAttention(nn.Module):
         else:
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
+                q,
+                k_cache,
+                v_cache,
+                k=k,
+                v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
                 window_size=window_size)
@@ -143,12 +148,17 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+# Transformer Block
 class Block(nn.Module):
+    """
+    Block is a transformer block that contains a causal self-attention layer and a MLP layer.
+    """
+
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-    
+
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         """
         Forward pass through the block.
@@ -165,3 +175,326 @@ class Block(nn.Module):
         x = self.attn(x, ve, cos_sin, window_size, kv_cache)
         x = self.mlp(x)
         return x
+
+
+class GPT(nn.Module):
+
+    def __init__(self, config, pad_vocab_size_to=64):
+        """
+        NOTE a major footgun: this __init__ function runs in meta device context (!!)
+        Therefore, any calculations inside here are shapes and dtypes only, no actual data.
+        => We actually initialize all data (parameters, buffers, etc.) in init_weights() instead.
+        """
+        super().__init__()
+        self.config = config
+        self.window_sizes = self._compute_window_sizes(config)
+        # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
+        # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
+        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) //
+                             pad_vocab_size_to) * pad_vocab_size_to
+        if padded_vocab_size != config.vocab_size:
+            print(
+                f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency"
+            )
+        self.transformer = nn.ModuleDict({
+            "wte":
+            nn.Embedding(padded_vocab_size, config.n_embd),
+            "h":
+            nn.ModuleList([
+                Block(config, layer_idx) for layer_idx in range(config.n_layer)
+            ]),
+        })
+        self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Per-layer learnable scalars (inspired by modded-nanogpt)
+        # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
+        # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
+        # Separate parameters so they can have different optimizer treatment
+        self.resid_lambdas = nn.Parameter(torch.ones(
+            config.n_layer))  # fake init, real init in init_weights()
+        self.x0_lambdas = nn.Parameter(torch.zeros(
+            config.n_layer))  # fake init, real init in init_weights()
+        # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        head_dim = config.n_embd // config.n_head
+        kv_dim = config.n_kv_head * head_dim
+        self.value_embeds = nn.ModuleDict({
+            str(i):
+            nn.Embedding(padded_vocab_size, kv_dim)
+            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+        })
+        # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
+        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
+        # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
+        # In the future we can dynamically grow the cache, for now it's fine.
+        self.rotary_seq_len = config.sequence_len * 10  # 10X over-compute should be enough, TODO make nicer?
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len,
+                                                      head_dim)
+        self.register_buffer(
+            "cos", cos, persistent=False
+        )  # persistent=False means it's not saved to the checkpoint
+        self.register_buffer("sin", sin, persistent=False)
+
+    @torch.no_grad()
+    def init_weights(self):
+        """
+        Steps: 
+            S1 - 
+                Initialize the weights of the embedding and unembedding layers.
+            S2 - 
+                Initialize the weights of the transformer blocks.
+            S3 - 
+                Initialize the weights of the residual lambdas and x0 lambdas.
+            S4 - 
+                Initialize the weights of the value embeddings. #TODO: Why is this separate from the transformer blocks?
+            S5 - 
+                Initialize the rotary embeddings.
+            S6 - 
+                Convert the weights to bfloat16 if on GPU.
+        """
+        # S1
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
+        # S2
+        n_embd = self.config.n_embd
+        s = 3**0.5 * n_embd**-0.5
+        for block in self.transformer.h:
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s,
+                                   s)  # weights use Uniform to avoid outliers
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(
+                block.attn.c_proj.weight)  # projections are zero
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        # S3
+        self.resid_lambdas.fill_(1.0)
+        self.x0_lambdas.fill_(0.0)
+
+        # S4
+        for ve in self.value_embeds.values():
+            torch.nn.init.uniform_(ve.weight, -s, s)
+        for block in self.transformer.h:
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # S5
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len,
+                                                      head_dim)
+        self.cos, self.sin = cos, sin
+
+        # S6
+        if self.transformer.wte.weight.device.type == "cuda":
+            self.transformer.wte.to(dtype=torch.bfloat16)
+            for ve in self.value_embeds.values():
+                ve.to(dtype=torch.bfloat16)
+
+    def _precompute_rotary_embeddings(self,
+                                      seq_len,
+                                      head_dim,
+                                      base=10000,
+                                      device=None):
+        """
+        Precompute the rotary embeddings for the given sequence length and head dimension.
+        """
+        # TODO: bump base theta more? e.g. 100K is more common more recently
+        # autodetect the device from model embeddings
+        if device is None:
+            device = self.transformer.wte.weight.device
+        # stride the channels
+        channel_range = torch.arange(0,
+                                     head_dim,
+                                     2,
+                                     dtype=torch.float32,
+                                     device=device)
+        inv_freq = 1.0 / (base**(channel_range / head_dim))
+        # stride the time steps
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        # calculate the rotation frequencies at each (time, channel) pair
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        cos, sin = cos.bfloat16(), sin.bfloat16()  # keep them in bfloat16
+        cos, sin = cos[None, :, None, :], sin[
+            None, :, None, :]  # add batch and head dims for later broadcasting
+        return cos, sin
+
+    def _compute_window_sizes(self, config):
+        """
+        Compute per-layer window sizes for sliding window attention.
+
+        Returns list of (left, right) tuples for FA3's window_size parameter:
+        - left: how many tokens before current position to attend to (-1 = unlimited)
+        - right: how many tokens after current position to attend to (0 for causal)
+
+        Pattern string is tiled across layers. Final layer always gets L (full context).
+        Characters: L=long (full context), S=short (half context)
+        """
+        pattern = config.window_pattern.upper()
+        assert all(
+            c in "SL" for c in
+            pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
+        # Map characters to window sizes
+        long_window = config.sequence_len
+        short_window = long_window // 2
+        char_to_window = {
+            "L": (long_window, 0),
+            "S": (short_window, 0),
+        }
+        # Tile pattern across layers
+        window_sizes = []
+        for layer_idx in range(config.n_layer):
+            char = pattern[layer_idx % len(pattern)]
+            window_sizes.append(char_to_window[char])
+        # Final layer always gets full context
+        window_sizes[-1] = (long_window, 0)
+        return window_sizes
+
+    def get_device(self):
+        return self.transformer.wte.weight.device
+
+    def estimate_flops(self):
+        """
+        Return the estimated FLOPs per token for the model (forward + backward).
+        Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
+        Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
+        On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
+        With sliding windows, effective_seq_len varies per layer (capped by window size).
+        Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
+        This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
+        - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
+        - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+        """
+        nparams = sum(p.numel() for p in self.parameters())
+        # Exclude non-matmul params: embeddings and per-layer scalars
+        value_embeds_numel = sum(ve.weight.numel()
+                                 for ve in self.value_embeds.values())
+        nparams_exclude = (self.transformer.wte.weight.numel() +
+                           value_embeds_numel + self.resid_lambdas.numel() +
+                           self.x0_lambdas.numel())
+        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        # Sum attention FLOPs per layer, accounting for sliding window
+        attn_flops = 0
+        for window_size in self.window_sizes:
+            window = window_size[0]  # (left, right) tuple, we use left
+            effective_seq = t if window < 0 else min(window, t)
+            attn_flops += 12 * h * q * effective_seq
+        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        return num_flops_per_token
+
+    def num_scaling_params(self):
+        """
+        Return detailed parameter counts for scaling law analysis.
+        Different papers use different conventions:
+        - Kaplan et al. excluded embedding parameters
+        - Chinchilla included all parameters
+        Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper)
+        Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
+
+        Returns a dict with counts for each parameter group, so downstream analysis
+        can experiment with which combination gives the cleanest scaling laws.
+        """
+        # Count each group separately (mirrors the grouping in setup_optimizers)
+        wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        transformer_matrices = sum(p.numel()
+                                   for p in self.transformer.h.parameters())
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        assert total == sum(
+            p.numel() for p in self.parameters()), "Parameter count mismatch"
+        return {
+            'wte': wte,
+            'value_embeds': value_embeds,
+            'lm_head': lm_head,
+            'transformer_matrices': transformer_matrices,
+            'scalars': scalars,
+            'total': total,
+        }
+
+    def setup_optimizer(self,
+                        unembedding_lr=0.004,
+                        embedding_lr=0.2,
+                        matrix_lr=0.02,
+                        weight_decay=0.0,
+                        adam_betas=(0.8, 0.95),
+                        scalar_lr=0.5):
+        """
+        Setup the optimizer for the model.
+        """
+        model_dim = self.config.n_embd
+        ddp, rank, local_rank, world_size = get_dist_info()
+
+        # Separate out all parameters into groups/
+        matrix_params = list(self.transformer.h.parameters())
+        value_embeds_params = list(self.value_embeds.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == len(matrix_params) + len(
+            embedding_params) + len(lm_head_params) + len(
+                value_embeds_params) + len(resid_params) + len(x0_params)
+
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768)**-0.5
+        print(
+            f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
+        )
+
+        # Build param_groups with all required fields explicit
+        param_groups = [
+            # AdamW groups (embeddings, lm_head, scalars)
+            dict(kind='adamw',
+                 params=lm_head_params,
+                 lr=unembedding_lr * dmodel_lr_scale,
+                 betas=adam_betas,
+                 eps=1e-10,
+                 weight_decay=0.0),
+            dict(kind='adamw',
+                 params=embedding_params,
+                 lr=embedding_lr * dmodel_lr_scale,
+                 betas=adam_betas,
+                 eps=1e-10,
+                 weight_decay=0.0),
+            dict(kind='adamw',
+                 params=value_embeds_params,
+                 lr=embedding_lr * dmodel_lr_scale,
+                 betas=adam_betas,
+                 eps=1e-10,
+                 weight_decay=0.0),
+            dict(kind='adamw',
+                 params=resid_params,
+                 lr=scalar_lr * 0.01,
+                 betas=adam_betas,
+                 eps=1e-10,
+                 weight_decay=0.0),
+            dict(kind='adamw',
+                 params=x0_params,
+                 lr=scalar_lr,
+                 betas=(0.96, 0.95),
+                 eps=1e-10,
+                 weight_decay=0.0),  # higher beta1 for x0
+        ]
+        # Muon groups (matrix params, grouped by shape for stacking)
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(
+                dict(
+                    kind='muon',
+                    params=group_params,
+                    lr=matrix_lr,
+                    momentum=0.95,
+                    ns_steps=5,
+                    beta2=0.95,
+                    weight_decay=weight_decay,
+                ))
+
+        # Factory = DistMuonAdamW if ddp else MuonAdamW
+        # optimizer = Factory(param_groups)
+
+        optimizer = torch.optim.AdamW(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer

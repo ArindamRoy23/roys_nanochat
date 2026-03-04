@@ -177,6 +177,7 @@ def test_block(small_config):
     window_size = (-1, -1)
     kv_cache = None
     y = block.forward(x, ve, cos_sin, window_size, kv_cache)
+    assert y.shape == (1, 16, small_config.n_embd)
 
 
 if __name__ == "__main__":
