@@ -498,3 +498,45 @@ class GPT(nn.Module):
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
+    
+    def forward(self, idx, targets , kv_cache=None, loss_reduce='mean'):
+        B, T = idx.size() # Batch_size, Token_length
+        
+        # T0 is the starting position of the current forward pass
+        # If kv_cache is None, we are at the beginning, so T0 = 0
+        # If kv_cache is not None, we are continuing from a previous forward pass, so T0 = kv_cache.get_pos()
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        
+        # Get the token embeddings
+        x = self.transformer.wte(idx) # (B, T, C) : (16, 1024, 768)
+        # Normalize the token embeddings (B, T, C) : (16, 1024, 768)
+        x = norm(x) 
+        x0 = x 
+
+        # For each layer in the transformer
+        # We add the residual scaling factor and the x0 scaling factor to the input
+        # x = resid_lambda * x + x0_lambda * x0
+        # Then we pass the input through the transformer block
+        # x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+        x = norm(x) # (B, T, C) : (16, 1024, 768)
+
+        # Cap the logits to prevent overflow
+        softcap = 15
+
+        # Get the logits from the transformer
+        logits = self.lm_head(x) # (B, T, vocab_size) : (16, 1024, 50257)
+        
+        
+        # Get the logits from the transformer
+        logits = logits[..., :self.config.vocab_size]
+
+        
+        
+
+            
+        
