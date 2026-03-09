@@ -1,6 +1,6 @@
 import torch
 import pytest
-from nanochat.gpt import norm, Block, MLP, GPTConfig, CausalSelfAttention, has_ve
+from nanochat.gpt import norm, Block, MLP, GPTConfig, CausalSelfAttention, has_ve, GPT
 from tests.conftest import create_rope_cos_sin, MockKVCache
 
 
@@ -178,6 +178,15 @@ def test_block(small_config):
     kv_cache = None
     y = block.forward(x, ve, cos_sin, window_size, kv_cache)
     assert y.shape == (1, 16, small_config.n_embd)
+
+def test_gpt(small_config):
+    gpt = GPT(small_config)
+    idx = torch.randint(0, small_config.vocab_size, (1, 16))
+    targets = torch.randint(0, small_config.vocab_size, (1, 16))
+    # Test with targets (returns loss)
+    loss = gpt.forward(idx, targets)
+    assert loss.ndim == 0 # scalar loss
+    assert torch.isfinite(loss)
 
 
 if __name__ == "__main__":

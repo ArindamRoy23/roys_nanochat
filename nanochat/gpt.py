@@ -534,8 +534,13 @@ class GPT(nn.Module):
         
         # Get the logits from the transformer
         logits = logits[..., :self.config.vocab_size]
-
-        
+        logits = logits.float() # switch to fp32 for logit softcap and loss computation
+        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        if targets is not None:
+            # Compute the loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction=loss_reduce)
+            return loss
+        return logits
         
 
             
