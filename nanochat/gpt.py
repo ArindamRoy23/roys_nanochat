@@ -521,7 +521,17 @@ class GPT(nn.Module):
         # x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            if str(i) in self.value_embeds:
+                # Value embedding is learned per token, but attention expects
+                # a (B, 1, n_kv_head, head_dim) tensor that can broadcast over time.
+                ve_raw = self.value_embeds[str(i)](idx)  # (B, T, kv_dim = n_kv_head * head_dim)
+                B, T, kv_dim = ve_raw.shape
+                head_dim = self.config.n_embd // self.config.n_head
+                n_kv_head = self.config.n_kv_head
+                ve = ve_raw.view(B, T, n_kv_head, head_dim)  # (B, T, n_kv_head, head_dim)
+                ve = ve[:, :1, :, :]  # (B, 1, n_kv_head, head_dim) for broadcasting
+            else:
+                ve = None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x) # (B, T, C) : (16, 1024, 768)
 
